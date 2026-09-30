@@ -283,7 +283,6 @@ def _interrupt_main_thread():
 @contextlib.contextmanager
 def run_concurrently_context(
     *fns: Callable[..., Any] | tuple[Callable[..., Any], ...],
-    interrupt_on_failure: bool = True,
 ) -> Generator[list[futures.Future], None, None]:
     """Run functions concurrently in a thread pool.
 
@@ -294,7 +293,6 @@ def run_concurrently_context(
 
     Args:
         *fns: The functions to run.
-        interrupt_on_failure: Whether to wake the main thread if a task fails.
 
     Yields:
         The futures for the functions.
@@ -348,10 +346,9 @@ def run_concurrently_context(
     try:
         executor = futures.ThreadPoolExecutor(max_workers=len(fns))
         # Submit the tasks.
-        tasks = [executor.submit(fn[0], *fn[1:]) for fn in fns]
-        if interrupt_on_failure:
-            for task in tasks:
-                task.add_done_callback(wake_main_thread)
+        tasks = [executor.submit(*fn) for fn in fns]
+        for task in tasks:
+            task.add_done_callback(wake_main_thread)
 
         try:
             try:

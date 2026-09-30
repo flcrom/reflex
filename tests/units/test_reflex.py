@@ -438,370 +438,79 @@ def test_init_records_version_check_after_frontend_setup(
     assert events == ["frontend", "version"]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
-def test_frontend_preflight_failure_cleans_process(tmp_path):
-    ready = tmp_path / "frontend.pid"
-    driver = tmp_path / "driver.py"
-    driver.write_text(
-        """import subprocess, sys, types
-from reflex.utils import build, exec as exec_mod, telemetry
-
-def frontend(*args):
-    p = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
-    exec_mod.frontend_process = p
-    with open(PIDS, "w") as handshake:
-        handshake.write(str(p.pid))
-    sys.stderr.write("x" * 131072)
-    raise SystemExit(3)
-
-exec_mod.run_frontend = frontend
-exec_mod.run_backend = lambda *args: None
-telemetry.send = lambda *args, **kwargs: None
-build.setup_frontend = lambda *args, **kwargs: None
-import reflex.reflex as rx
-rx._compile_app = lambda: None
-rx.get_config = lambda: types.SimpleNamespace(
-    _set_persistent=lambda **kwargs: None,
-    loglevel=types.SimpleNamespace(subprocess_level=lambda: None),
+posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX process groups and signals"
 )
-from reflex_base import constants
-rx._run_dev(constants.RunningMode.FULLSTACK, 3000, 8000, "127.0.0.1")
-""".replace("PIDS", repr(str(ready)))
-    )
-    launcher = subprocess.Popen(
-        [sys.executable, str(driver)],
-        cwd=tmp_path,
-        start_new_session=True,
-        stderr=subprocess.PIPE,
-    )
-    child = None
-    try:
-        _, stderr = launcher.communicate(timeout=DEFAULT_TIMEOUT)
-        assert ready.exists(), (
-            "frontend did not start: " + stderr.decode(errors="replace")[-1000:]
-        )
-        child = int(ready.read_text())
-        assert launcher.returncode == 3, stderr.decode(errors="replace")[-1000:]
-        with contextlib.suppress(psutil.NoSuchProcess):
-            assert psutil.Process(child).status() in (
-                psutil.STATUS_ZOMBIE,
-                psutil.STATUS_DEAD,
-            )
-    finally:
-        if launcher.poll() is None:
-            os.killpg(launcher.pid, signal.SIGKILL)
-            launcher.communicate(timeout=DEFAULT_TIMEOUT)
-        if child is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(child, signal.SIGKILL)
 
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
-def test_late_frontend_start_stops_after_backend_returns(tmp_path):
-    """A frontend started after backend teardown must exit without hanging."""
-    pids = tmp_path / "frontend.pid"
-    driver = tmp_path / "driver.py"
-    driver.write_text(
-        """import subprocess, sys, time, types
+# Stubs the app and frontend setup so `_run_dev` launches stand-in processes.
+# `PIDS` receives the pid of each launched frontend.
+_DRIVER_TEMPLATE = """import signal, subprocess, sys, threading, time, types
 from pathlib import Path
 from reflex.utils import build, exec as exec_mod, processes, telemetry
 
-original_new_process = processes.new_process
-def record_process(*args, **kwargs):
-    deadline = time.monotonic() + 5
-    while not exec_mod._frontend_shutting_down and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert exec_mod._frontend_shutting_down
-    p = original_new_process(*args, **kwargs)
-    with open(PIDS, "w") as handshake:
-        handshake.write(str(p.pid))
-    return p
-processes.new_process = record_process
-exec_mod.get_web_dir = lambda: Path.cwd()
-exec_mod.get_package_json_and_hash = lambda *args: ({}, "unchanged")
-exec_mod.frontend_env = lambda *args: {}
-exec_mod.path_ops.get_node_bin_path = lambda: None
-
-def frontend(*args):
-    exec_mod.run_process_and_launch_url(
-        [sys.executable, "-c", "import time;time.sleep(60)"], True
-    )
-
-def backend(*args):
-    return None
-
-exec_mod.run_frontend = frontend
-exec_mod.run_backend = backend
+PIDS = {pids!r}
 telemetry.send = lambda *args, **kwargs: None
 build.setup_frontend = lambda *args, **kwargs: None
-import reflex.reflex as rx
-rx._compile_app = lambda: None
-rx.get_config = lambda: types.SimpleNamespace(
-    _set_persistent=lambda **kwargs: None,
-    loglevel=types.SimpleNamespace(subprocess_level=lambda: None),
-)
-from reflex_base import constants
-rx._run_dev(constants.RunningMode.FULLSTACK, 3000, 8000, "127.0.0.1")
-""".replace("PIDS", repr(str(pids)))
-    )
-    launcher = subprocess.Popen(
-        [sys.executable, str(driver)],
-        cwd=tmp_path,
-        start_new_session=True,
-        stderr=subprocess.PIPE,
-    )
-    child = None
-    try:
-        try:
-            launcher.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            pytest.fail("late frontend trapped the run after backend returned")
-        assert launcher.returncode == 0
-        assert pids.exists(), "late frontend never launched"
-        child = int(pids.read_text().strip())
-        with contextlib.suppress(psutil.NoSuchProcess):
-            assert psutil.Process(child).status() in (
-                psutil.STATUS_ZOMBIE,
-                psutil.STATUS_DEAD,
-            )
-    finally:
-        if launcher.poll() is None:
-            os.killpg(launcher.pid, signal.SIGKILL)
-            launcher.wait(timeout=DEFAULT_TIMEOUT)
-        if child is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(child, signal.SIGKILL)
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
-def test_fullstack_backend_exit_stops_frontend(tmp_path):
-    """Frontend must not trap the run after a normal backend return."""
-    pids = tmp_path / "frontend.pid"
-    driver = tmp_path / "driver.py"
-    driver.write_text(
-        """import subprocess, sys, time, types
-from pathlib import Path
-from reflex.utils import build, exec as exec_mod, processes, telemetry
-
-exec_mod.get_web_dir = lambda: Path.cwd()
-exec_mod.get_package_json_and_hash = lambda *args: ({}, "unchanged")
-exec_mod.frontend_env = lambda *args: {}
+exec_mod.get_web_dir = Path.cwd
+exec_mod.get_package_json_and_hash = lambda *args: ({{}}, "unchanged")
+exec_mod.frontend_env = lambda *args: {{}}
 exec_mod.path_ops.get_node_bin_path = lambda: None
 original_new_process = processes.new_process
+
 def record_process(*args, **kwargs):
     p = original_new_process(*args, **kwargs)
-    with open(PIDS, "w") as handshake:
-        handshake.write(str(p.pid))
+    Path(PIDS).write_text(str(p.pid))
     return p
+
 processes.new_process = record_process
-exec_mod.run_frontend = lambda *args: exec_mod.run_process_and_launch_url(
-    [sys.executable, "-c", "import time;time.sleep(60)"], True
-)
-def backend(*args):
-    from pathlib import Path
-    deadline = time.monotonic() + 5
-    while not Path(PIDS).exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-exec_mod.run_backend = backend
-telemetry.send = lambda *args, **kwargs: None
-build.setup_frontend = lambda *args, **kwargs: None
+
+def launch_frontend(code):
+    exec_mod.run_frontend = lambda *args: exec_mod.run_process_and_launch_url(
+        [sys.executable, "-c", code], True
+    )
+
+{body}
+
 import reflex.reflex as rx
+from reflex_base import constants
 rx._compile_app = lambda: None
 rx.get_config = lambda: types.SimpleNamespace(
     _set_persistent=lambda **kwargs: None,
     loglevel=types.SimpleNamespace(subprocess_level=lambda: None),
 )
-from reflex_base import constants
-rx._run_dev(constants.RunningMode.FULLSTACK, 3000, 8000, "127.0.0.1")
-""".replace("PIDS", repr(str(pids)))
-    )
-    launcher = subprocess.Popen(
-        [sys.executable, str(driver)],
-        cwd=tmp_path,
-        start_new_session=True,
-        stderr=subprocess.PIPE,
-    )
-    child = None
-    try:
-        deadline = time.monotonic() + DEFAULT_TIMEOUT
-        while time.monotonic() < deadline:
-            if launcher.poll() is not None:
-                pytest.fail(f"launcher exited early: {launcher.returncode}")
-            if pids.exists() and (pid := pids.read_text().strip()):
-                child = int(pid)
-                break
-            time.sleep(0.01)
-        assert child is not None
-        try:
-            launcher.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pytest.fail("full-stack run hung after backend returned")
-        assert launcher.returncode == 0
-        with contextlib.suppress(psutil.NoSuchProcess):
-            assert psutil.Process(child).status() in (
-                psutil.STATUS_ZOMBIE,
-                psutil.STATUS_DEAD,
-            )
-    finally:
-        if launcher.poll() is None:
-            os.killpg(launcher.pid, signal.SIGKILL)
-            launcher.wait(timeout=DEFAULT_TIMEOUT)
-        if child is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(child, signal.SIGKILL)
+rx._run_dev(constants.RunningMode.{mode}, 3000, {backend_port}, "127.0.0.1")
+"""
 
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
-@pytest.mark.parametrize("mode", ["frontend", "fullstack"])
-def test_sigkill_run_group_stops_frontend(tmp_path, mode):
-    """A hard kill of the CLI job group must not leave frontend workers alive."""
-    pids = tmp_path / "children"
-    driver = tmp_path / "driver.py"
-    driver.write_text(
-        """import subprocess, sys, time, types
-from pathlib import Path
-from reflex.utils import build, exec as exec_mod, processes, telemetry
-
-code = "import subprocess,sys,time\\n" + \
-    "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\\n" + \
-    "print(p.pid,flush=True);time.sleep(60)\\n"
-exec_mod.get_web_dir=lambda:Path.cwd()
-exec_mod.get_package_json_and_hash=lambda *args:({}, "unchanged")
-exec_mod.frontend_env=lambda *args:{}
-exec_mod.path_ops.get_node_bin_path=lambda:None
-original_new_process=processes.new_process
-def record_process(*args,**kwargs):
-    p=original_new_process(*args,**kwargs)
-    with open(PIDS,"w") as handshake:
-        handshake.write(str(p.pid))
-    return p
-processes.new_process=record_process
-exec_mod.run_frontend=lambda *args:exec_mod.run_process_and_launch_url(
-    [sys.executable,"-c",code],True
+# A frontend that starts a worker and stops it on SIGTERM, like bun and node.
+_FRONTEND_TREE = (
+    "import signal,subprocess,sys,time\n"
+    "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+    "signal.signal(signal.SIGTERM, lambda *a: (p.terminate(), sys.exit(0)))\n"
+    "print(p.pid,flush=True);time.sleep(60)\n"
 )
-exec_mod.run_backend=lambda *args: time.sleep(60)
-telemetry.send=lambda *a,**k:None
-build.setup_frontend=lambda *a,**k:None
-import reflex.reflex as rx
-rx._compile_app=lambda:None
-rx.get_config=lambda:types.SimpleNamespace(_set_persistent=lambda **k:None,
-    loglevel=types.SimpleNamespace(subprocess_level=lambda:None))
-from reflex_base import constants
-rx._run_dev(MODE,3000,PORT,"127.0.0.1")
-"""
-        .replace("PIDS", repr(str(pids)))
-        .replace(
-            "MODE",
-            "constants.RunningMode.FRONTEND_ONLY"
-            if mode == "frontend"
-            else "constants.RunningMode.FULLSTACK",
-        )
-        .replace("PORT", "None" if mode == "frontend" else "8000")
-    )
-    launcher = subprocess.Popen(
-        [sys.executable, str(driver)],
-        cwd=tmp_path,
-        start_new_session=True,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    child = grandchild = None
-    try:
-        deadline = time.monotonic() + DEFAULT_TIMEOUT
-        while time.monotonic() < deadline:
-            if launcher.poll() is not None:
-                pytest.fail(f"launcher exited early: {launcher.returncode}")
-            if pids.exists():
-                parts = pids.read_text().split()
-                if len(parts) == 1:
-                    child = int(parts[0])
-                    children = psutil.Process(child).children()
-                    if children:
-                        grandchild = children[0].pid
-                        break
-            time.sleep(0.01)
-        assert child is not None
-        assert grandchild is not None
-        assert os.getpgid(child) == launcher.pid
-        os.killpg(launcher.pid, signal.SIGKILL)
-        launcher.wait(timeout=DEFAULT_TIMEOUT)
-        for pid in (child, grandchild):
-            deadline = time.monotonic() + DEFAULT_TIMEOUT
-            while time.monotonic() < deadline:
-                try:
-                    if psutil.Process(pid).status() in (
-                        psutil.STATUS_ZOMBIE,
-                        psutil.STATUS_DEAD,
-                    ):
-                        break
-                except psutil.NoSuchProcess:
-                    break
-                time.sleep(0.05)
-            else:
-                pytest.fail(f"frontend descendant {pid} survived SIGKILL")
-    finally:
-        if launcher.poll() is None:
-            os.killpg(launcher.pid, signal.SIGKILL)
-            launcher.wait(timeout=DEFAULT_TIMEOUT)
-        if child is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child, signal.SIGKILL)
-        for pid in (child, grandchild):
-            if pid is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
-@pytest.mark.parametrize("mode", ["frontend", "fullstack"])
-@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
-def test_no_tty_run_stops_frontend(tmp_path, mode, sig):
-    """Headless runs stop the frontend on SIGTERM or SIGINT."""
-    pids = tmp_path / "children"
+def _start_driver(tmp_path, body: str, mode: str = "FULLSTACK") -> subprocess.Popen:
+    """Run `_run_dev` in a new session with no TTY.
+
+    Args:
+        tmp_path: The directory for the driver script and the pid file.
+        body: Driver code that stubs the frontend and the backend.
+        mode: The RunningMode member name.
+
+    Returns:
+        The launcher process.
+    """
     driver = tmp_path / "driver.py"
     driver.write_text(
-        """import signal, subprocess, sys, time, types
-from reflex.utils import build, exec as exec_mod, telemetry
-
-def frontend(*args):
-    code = "import signal,subprocess,sys,time\\n" + \
-        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\\n" + \
-        "signal.signal(signal.SIGTERM, lambda *a: (p.terminate(), sys.exit(0)))\\n" + \
-        "print(p.pid,flush=True);time.sleep(60)\\n"
-    p = subprocess.Popen([sys.executable,"-c",code],stdout=subprocess.PIPE,text=True)
-    grandchild = int(p.stdout.readline())
-    exec_mod.frontend_process = p
-    with open(PIDS,"w") as handshake:
-        handshake.write(f"{p.pid} {grandchild}")
-    p.wait()
-
-def backend(*args):
-    def stop(sig,frame): raise SystemExit(0)
-    signal.signal(signal.SIGTERM,stop)
-    signal.signal(signal.SIGINT,stop)
-    while True: time.sleep(1)
-
-exec_mod.run_frontend=frontend
-exec_mod.run_backend=backend
-telemetry.send=lambda *a,**k:None
-build.setup_frontend=lambda *a,**k:None
-import reflex.reflex as rx
-rx._compile_app=lambda:None
-rx.get_config=lambda:types.SimpleNamespace(_set_persistent=lambda **k:None,
-    loglevel=types.SimpleNamespace(subprocess_level=lambda:None))
-from reflex_base import constants
-rx._run_dev(MODE,3000,PORT,"127.0.0.1")
-"""
-        .replace("PIDS", repr(str(pids)))
-        .replace(
-            "MODE",
-            "constants.RunningMode.FRONTEND_ONLY"
-            if mode == "frontend"
-            else "constants.RunningMode.FULLSTACK",
+        _DRIVER_TEMPLATE.format(
+            pids=str(tmp_path / "frontend.pid"),
+            body=body,
+            mode=mode,
+            backend_port="None" if mode == "FRONTEND_ONLY" else "8000",
         )
-        .replace("PORT", "None" if mode == "frontend" else "8000")
     )
-    launcher = subprocess.Popen(
+    return subprocess.Popen(
         [sys.executable, str(driver)],
         cwd=tmp_path,
         start_new_session=True,
@@ -809,51 +518,222 @@ rx._run_dev(MODE,3000,PORT,"127.0.0.1")
         stderr=subprocess.PIPE,
         text=True,
     )
-    child = grandchild = None
+
+
+def _wait_exit(launcher: subprocess.Popen) -> tuple[int, str]:
+    """Wait for the launcher to exit.
+
+    Args:
+        launcher: The launcher process.
+
+    Returns:
+        The return code and the stderr output.
+    """
     try:
-        deadline = time.monotonic() + DEFAULT_TIMEOUT
-        while time.monotonic() < deadline:
-            if launcher.poll() is not None:
-                pytest.fail(f"launcher exited early: {launcher.returncode}")
-            if pids.exists():
-                parts = pids.read_text().split()
-                if len(parts) == 2:
-                    child, grandchild = map(int, parts)
-                    break
-            time.sleep(0.01)
-        assert child is not None, "frontend did not start"
-        assert grandchild is not None, "frontend grandchild did not start"
-        os.kill(launcher.pid, getattr(signal, sig))
+        _, stderr = launcher.communicate(timeout=DEFAULT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the run did not exit")
+    return launcher.returncode, stderr
+
+
+def _read_pid(tmp_path) -> int:
+    """Read the pid of the launched frontend.
+
+    Args:
+        tmp_path: The directory of the pid file.
+
+    Returns:
+        The frontend pid.
+    """
+    pid_file = tmp_path / "frontend.pid"
+    assert pid_file.exists(), "frontend did not start"
+    return int(pid_file.read_text())
+
+
+def _wait_for_frontend_tree(launcher: subprocess.Popen, tmp_path) -> tuple[int, int]:
+    """Wait for the frontend and its worker to start.
+
+    Args:
+        launcher: The launcher process.
+        tmp_path: The directory of the pid file.
+
+    Returns:
+        The frontend pid and the worker pid.
+    """
+    pid_file = tmp_path / "frontend.pid"
+    deadline = time.monotonic() + DEFAULT_TIMEOUT
+    while time.monotonic() < deadline:
+        if launcher.poll() is not None:
+            pytest.fail(f"launcher exited early: {launcher.returncode}")
+        if pid_file.exists() and (text := pid_file.read_text()):
+            with contextlib.suppress(psutil.NoSuchProcess):
+                if children := psutil.Process(int(text)).children():
+                    return int(text), children[0].pid
+        time.sleep(0.01)
+    pytest.fail("frontend worker did not start")
+
+
+def _assert_stopped(pid: int):
+    """Assert that a process exits.
+
+    Args:
+        pid: The process id.
+    """
+    deadline = time.monotonic() + DEFAULT_TIMEOUT
+    while time.monotonic() < deadline:
         try:
-            returncode = launcher.wait(timeout=DEFAULT_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            pytest.fail("no-TTY launcher hung after signal")
-        if sig == "SIGINT":
-            assert returncode in (0, -signal.SIGINT)
-        else:
-            assert returncode == 0
-        for pid in (child, grandchild):
-            deadline = time.monotonic() + DEFAULT_TIMEOUT
-            while time.monotonic() < deadline:
-                try:
-                    if psutil.Process(pid).status() in (
-                        psutil.STATUS_ZOMBIE,
-                        psutil.STATUS_DEAD,
-                    ):
-                        break
-                except psutil.NoSuchProcess:
-                    break
-                time.sleep(0.05)
-            else:
-                pytest.fail(f"frontend descendant {pid} survived signal")
+            if psutil.Process(pid).status() in (
+                psutil.STATUS_ZOMBIE,
+                psutil.STATUS_DEAD,
+            ):
+                return
+        except psutil.NoSuchProcess:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"frontend process {pid} survived")
+
+
+@contextlib.contextmanager
+def _reaped(launcher: subprocess.Popen, pids: list[int]):
+    """Kill the launcher group and the listed processes on exit.
+
+    Args:
+        launcher: The launcher process.
+        pids: The processes to kill; filled in by the test.
+
+    Yields:
+        None.
+    """
+    try:
+        yield
     finally:
         if launcher.poll() is None:
             os.killpg(launcher.pid, signal.SIGKILL)
-            launcher.wait(timeout=DEFAULT_TIMEOUT)
-        if child is not None:
+            launcher.communicate(timeout=DEFAULT_TIMEOUT)
+        for pid in pids:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(child, signal.SIGKILL)
-        for pid in (child, grandchild):
-            if pid is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGKILL)
+
+
+@posix_only
+def test_frontend_preflight_failure_stops_frontend(tmp_path):
+    """A failing frontend task exits the run and stops its process."""
+    launcher = _start_driver(
+        tmp_path,
+        """
+def frontend(*args):
+    p = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
+    exec_mod.frontend_process = p
+    Path(PIDS).write_text(str(p.pid))
+    raise SystemExit(3)
+
+exec_mod.run_frontend = frontend
+exec_mod.run_backend = lambda *args: time.sleep(60)
+""",
+    )
+    pids = []
+    with _reaped(launcher, pids):
+        returncode, stderr = _wait_exit(launcher)
+        pids.append(_read_pid(tmp_path))
+        assert returncode == 3, stderr[-1000:]
+        _assert_stopped(pids[0])
+
+
+@posix_only
+def test_backend_return_stops_frontend(tmp_path):
+    """The run exits after the backend returns."""
+    launcher = _start_driver(
+        tmp_path,
+        """
+launch_frontend("import time;time.sleep(60)")
+
+def backend(*args):
+    deadline = time.monotonic() + 5
+    while not Path(PIDS).exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+exec_mod.run_backend = backend
+""",
+    )
+    pids = []
+    with _reaped(launcher, pids):
+        returncode, stderr = _wait_exit(launcher)
+        pids.append(_read_pid(tmp_path))
+        assert returncode == 0, stderr[-1000:]
+        _assert_stopped(pids[0])
+
+
+@posix_only
+def test_frontend_launched_after_stop_is_stopped(tmp_path):
+    """A frontend that starts after the run stops the frontend is also stopped."""
+    launcher = _start_driver(
+        tmp_path,
+        """
+stopped = threading.Event()
+original_stop_frontend = exec_mod.stop_frontend
+
+def stop_frontend():
+    original_stop_frontend()
+    stopped.set()
+
+exec_mod.stop_frontend = stop_frontend
+
+def late_process(*args, **kwargs):
+    assert stopped.wait(5)
+    return record_process(*args, **kwargs)
+
+processes.new_process = late_process
+launch_frontend("import time;time.sleep(60)")
+exec_mod.run_backend = lambda *args: None
+""",
+    )
+    pids = []
+    with _reaped(launcher, pids):
+        returncode, stderr = _wait_exit(launcher)
+        pids.append(_read_pid(tmp_path))
+        assert returncode == 0, stderr[-1000:]
+        _assert_stopped(pids[0])
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["FRONTEND_ONLY", "FULLSTACK"])
+@pytest.mark.parametrize(
+    ("sig", "returncodes"),
+    [
+        ("SIGTERM", (0,)),
+        ("SIGINT", (0, -signal.SIGINT)),
+        ("SIGKILL", (-signal.SIGKILL,)),
+    ],
+)
+def test_signal_stops_frontend_tree(tmp_path, mode, sig, returncodes):
+    """A signal to a run with no TTY stops the frontend and its worker."""
+    launcher = _start_driver(
+        tmp_path,
+        f"""
+launch_frontend({_FRONTEND_TREE!r})
+
+def backend(*args):
+    def stop(sig, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while True:
+        time.sleep(1)
+
+exec_mod.run_backend = backend
+""",
+        mode,
+    )
+    pids = []
+    with _reaped(launcher, pids):
+        pids.extend(_wait_for_frontend_tree(launcher, tmp_path))
+        if sig == "SIGKILL":
+            # A hard kill of the CLI job group must reach the frontend too.
+            assert os.getpgid(pids[0]) == launcher.pid
+            os.killpg(launcher.pid, signal.SIGKILL)
+        else:
+            os.kill(launcher.pid, getattr(signal, sig))
+        returncode, stderr = _wait_exit(launcher)
+        assert returncode in returncodes, stderr[-1000:]
+        for pid in pids:
+            _assert_stopped(pid)

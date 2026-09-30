@@ -267,6 +267,24 @@ def frontend_env(environ: Mapping[str, str]) -> dict[str, str]:
     return {"MIMALLOC_ARENA_EAGER_COMMIT": "0", **environ, "NO_COLOR": "1"}
 
 
+def reset_frontend_process():
+    """Clear the tracked frontend before a run starts."""
+    global frontend_process, _frontend_shutting_down
+    with _frontend_process_lock:
+        _frontend_shutting_down = False
+        frontend_process = None
+
+
+def stop_frontend():
+    """Terminate the tracked frontend and stop any later launch."""
+    global frontend_process, _frontend_shutting_down
+    with _frontend_process_lock:
+        _frontend_shutting_down = True
+        if frontend_process is not None and frontend_process.poll() is None:
+            frontend_process.terminate()
+        frontend_process = None
+
+
 # run_process_and_launch_url is assumed to be used
 # only to launch the frontend
 # If this is not the case, might have to change the logic
