@@ -1,0 +1,83 @@
+name: qa-7328-units
+on:
+  push:
+    branches: ["qa/7328-windows-current-main"]
+permissions:
+  contents: read
+concurrency:
+  group: qa-7328-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+jobs:
+  unit-tests:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    runs-on: ${{ matrix.os }}
+
+    # Service containers to run with `runner-job`
+    services:
+      # Label used to access the service container
+      redis:
+        image: ${{ matrix.os == 'ubuntu-latest' && 'redis' || '' }}
+        # Set health checks to wait until redis has started
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps port 6379 on service container to the host
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+          persist-credentials: false
+      # Fork-only setup: same pinned tools as upstream, with Actions cache off.
+      - name: Setup UV without Actions cache
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: false
+          activate-environment: true
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+      - name: Install Dependencies
+        run: uv sync
+        env:
+          UV_LOCK_TIMEOUT: "900"
+
+      - name: Run unit tests without db dependencies
+        run: |
+          export PYTHONUNBUFFERED=1
+          uv pip uninstall pydantic alembic sqlalchemy sqlmodel
+          uv run --no-sync pytest tests/units --cov --no-cov-on-fail --cov-report= --cov-fail-under=0
+          uv sync
+      - name: Run unit tests
+        run: |
+          export PYTHONUNBUFFERED=1
+          uv run pytest tests/units --cov --no-cov-on-fail --cov-report=
+      - name: Run unit tests w/ redis
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          export PYTHONUNBUFFERED=1
+          export REFLEX_REDIS_URL=redis://localhost:6379
+          uv run pytest tests/units --cov --no-cov-on-fail --cov-report=
+      - name: Run unit tests w/ redis and OPLOCK_ENABLED
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          export PYTHONUNBUFFERED=1
+          export REFLEX_REDIS_URL=redis://localhost:6379
+          export REFLEX_OPLOCK_ENABLED=true
+          uv run pytest tests/units --cov --no-cov-on-fail --cov-report=
+      - name: Generate coverage report
+        run: uv run coverage html
