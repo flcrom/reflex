@@ -40,6 +40,9 @@ jobs:
           fetch-tags: true
           fetch-depth: 0
           persist-credentials: false
+      # Runner-local tags restore the owning build plugin's per-package versions.
+      - name: Fetch upstream release tags for test build versions
+        run: git fetch --no-recurse-submodules https://github.com/reflex-dev/reflex.git 'refs/tags/*:refs/tags/*'
       # Fork-only setup: same pinned tools as upstream, with Actions cache off.
       - name: Setup UV without Actions cache
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
